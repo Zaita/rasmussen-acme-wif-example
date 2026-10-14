@@ -1,0 +1,48 @@
+# Obtains a certificate with the ACME wif-01 challenge
+# (https://datatracker.ietf.org/doc/draft-rasmussen-acme-wif/), proving
+# control of the identifiers with this job's GitHub Actions OIDC token
+# instead of DNS/HTTP validation or External Account Binding.
+#
+# The ACME server must accept the issuer
+# https://token.actions.githubusercontent.com and have a policy entry that
+# permits this workflow to obtain the identifiers below. Per Appendix A.1 of
+# the draft, that policy should match repository_id and repository_owner_id
+# (not the mutable names) and constrain ref or environment.
+#
+# Replace every value marked TODO before running.
+
+name: ACME wif-01 certificate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # lets the job request OIDC tokens for the wif-01 challenge
+
+jobs:
+  certificate:
+    runs-on: ubuntu-latest
+    env:
+      # ACME server
+      ACME_DIRECTORY_URL: https://app.zaita.com/api/acme/c8e5cdcd-e6f4-4014-9e7d-353e5ea47303/directory 
+      ACME_CONTACT_EMAIL: "scott@example.com"
+
+      # CSR fields; list fields are comma-separated
+      CSR_COMMON_NAME: test.zaita.com
+      CSR_DNS_NAMES: test.zaita.com
+      CSR_IP_ADDRESSES: ""
+      CSR_ORGANIZATION: Zaita
+      CSR_ORGANIZATIONAL_UNIT: Zaita OU
+      CSR_COUNTRY: NZ
+      CSR_PROVINCE: Wellington
+      CSR_LOCALITY: Wellington
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Obtain certificate
+        run: go run .
