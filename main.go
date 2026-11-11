@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -169,6 +170,17 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if issued > lifetime+time.Minute {
 		return fmt.Errorf("CA issued a certificate valid for %s, longer than the requested %s", issued, lifetime)
 	}
+	if issued <= 0 || !time.Now().Before(leaf.NotAfter) {
+		fmt.Fprintf(&summary, "| Certificate usable | **no**: expired on issuance |\n")
+		return fmt.Errorf("CA issued a certificate that is already expired (notBefore %s, notAfter %s, requested %s)",
+			leaf.NotBefore.UTC().Format(time.RFC3339), leaf.NotAfter.UTC().Format(time.RFC3339), lifetime)
+	}
+	if len(leaf.ExtKeyUsage) > 0 && !slices.ContainsFunc(leaf.ExtKeyUsage, func(u x509.ExtKeyUsage) bool {
+		return u == x509.ExtKeyUsageClientAuth || u == x509.ExtKeyUsageAny
+	}) {
+		fmt.Fprintf(&summary, "| Certificate usable | **no**: EKU lacks clientAuth |\n")
+		return errors.New("CA issued a certificate whose extended key usage does not include clientAuth; it cannot be used for mTLS")
+	}
 
 	if mtlsURL != "" {
 		status, body, err := mtlsProbe(ctx, mtlsURL, &clientCert)
@@ -216,7 +228,24 @@ func tlsCertificate(chainPEM []byte, key *ecdsa.PrivateKey) (tls.Certificate, er
 func mtlsProbe(ctx context.Context, url string, cert *tls.Certificate) (int, string, error) {
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
 	if cert != nil {
-		tlsConfig.Certificates = []tls.Certificate{*cert}
+		// Go silently sends no certificate when the chain doesn't match the
+		// server's acceptable CAs; fail with the reason instead.
+		tlsConfig.GetClientCertificate = func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			if err := cri.SupportsCertificate(cert); err != nil {
+				var accepted []string
+				for _, raw := range cri.AcceptableCAs {
+					var rdn pkix.RDNSequence
+					if _, err := asn1.Unmarshal(raw, &rdn); err == nil {
+						var name pkix.Name
+						name.FillFromRDNSequence(&rdn)
+						accepted = append(accepted, name.String())
+					}
+				}
+				return nil, fmt.Errorf("server will not accept the issued certificate (issuer %q; server accepts %q): %w",
+					cert.Leaf.Issuer.String(), accepted, err)
+			}
+			return cert, nil
+		}
 	}
 	client := &http.Client{
 		Timeout:   30 * time.Second,
