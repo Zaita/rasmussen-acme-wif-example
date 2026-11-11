@@ -30,12 +30,12 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # ACME server
-      ACME_DIRECTORY_URL: https://app.zaita.com/api/acme/c8e5cdcd-e6f4-4014-9e7d-353e5ea47303/directory 
-      ACME_CONTACT_EMAIL: "scott@example.com"
+      ACME_DIRECTORY_URL: https://demo.zaita.com/api/acme/f02df6be-6952-4ab2-856e-66e8d8e7ddb6/directory 
+      ACME_CONTACT_EMAIL: "support@zaita.com"
 
       # CSR fields; list fields are comma-separated
-      CSR_COMMON_NAME: test.zaita.com
-      CSR_DNS_NAMES: test.zaita.com
+      CSR_COMMON_NAME: mtls-test-client.zaita.com
+      CSR_DNS_NAMES: mtls-test-client.zaita.com
       CSR_IP_ADDRESSES: ""
       CSR_ORGANIZATION: Zaita
       CSR_ORGANIZATIONAL_UNIT: Zaita OU
