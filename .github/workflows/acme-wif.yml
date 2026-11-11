@@ -9,6 +9,11 @@
 # the draft, that policy should match repository_id and repository_owner_id
 # (not the mutable names) and constrain ref or environment.
 #
+# After issuance the job uses the certificate (requested with a
+# CERT_LIFETIME validity) as a TLS client certificate against MTLS_TEST_URL.
+# It first checks that the endpoint rejects a request without a client
+# certificate, then requires the request with the new certificate to succeed.
+#
 # Replace every value marked TODO before running.
 
 name: ACME wif-01 certificate
@@ -37,6 +42,10 @@ jobs:
       CSR_COUNTRY: NZ
       CSR_PROVINCE: Wellington
       CSR_LOCALITY: Wellington
+
+      # Short-lived certificate used as an mTLS client credential
+      CERT_LIFETIME: 5m
+      MTLS_TEST_URL: https://mtls-test.zaita.com
     steps:
       - uses: actions/checkout@v5
 

@@ -9,12 +9,16 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -38,8 +42,36 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return errors.New("ACME_DIRECTORY_URL is required")
 	}
 
+	lifetime := 5 * time.Minute
+	if v := os.Getenv("CERT_LIFETIME"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("CERT_LIFETIME: invalid duration %q", v)
+		}
+		lifetime = d
+	}
+	mtlsURL := os.Getenv("MTLS_TEST_URL")
+
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
+
+	var summary strings.Builder
+
+	// Baseline: without a client certificate the mTLS endpoint must refuse
+	// the request, otherwise the later success would prove nothing.
+	if mtlsURL != "" {
+		status, body, err := mtlsProbe(ctx, mtlsURL, nil)
+		switch {
+		case err != nil:
+			logger.Info("baseline without client certificate failed as expected", "url", mtlsURL, "error", err)
+			fmt.Fprintf(&summary, "| Baseline (no client cert) | failed as expected: `%v` |\n", err)
+		case status >= 200 && status < 300:
+			return fmt.Errorf("baseline request to %s without a client certificate succeeded (HTTP %d); the endpoint does not enforce mTLS", mtlsURL, status)
+		default:
+			logger.Info("baseline without client certificate failed as expected", "url", mtlsURL, "status", status, "body", body)
+			fmt.Fprintf(&summary, "| Baseline (no client cert) | failed as expected: HTTP %d |\n", status)
+		}
+	}
 
 	client := acmez.Client{
 		Client: &acme.Client{
@@ -95,6 +127,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("building order: %w", err)
 	}
+	now := time.Now()
+	params.NotBefore = now
+	params.NotAfter = now.Add(lifetime)
+	logger.Info("requesting short-lived certificate", "notBefore", params.NotBefore, "notAfter", params.NotAfter)
 
 	certs, err := client.ObtainCertificate(ctx, params)
 	if err != nil {
@@ -107,12 +143,96 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 	// Print only the certificate chain; the private key never leaves memory.
 	fmt.Print(string(chain))
-	if path := os.Getenv("GITHUB_STEP_SUMMARY"); path != "" {
-		if err := appendSummary(path, chain); err != nil {
-			logger.Warn("writing job summary", "error", err)
+
+	clientCert, err := tlsCertificate(chain, certKey)
+	if err != nil {
+		return err
+	}
+	leaf := clientCert.Leaf
+	issued := leaf.NotAfter.Sub(leaf.NotBefore)
+	logger.Info("issued certificate",
+		"subject", leaf.Subject.String(), "issuer", leaf.Issuer.String(),
+		"notBefore", leaf.NotBefore, "notAfter", leaf.NotAfter, "lifetime", issued)
+	fmt.Fprintf(&summary, "| Certificate validity | %s → %s (%s) |\n",
+		leaf.NotBefore.UTC().Format(time.RFC3339), leaf.NotAfter.UTC().Format(time.RFC3339), issued)
+
+	// Write what we have so far even if a later check fails.
+	defer func() {
+		if path := os.Getenv("GITHUB_STEP_SUMMARY"); path != "" {
+			if err := appendSummary(path, chain, summary.String()); err != nil {
+				logger.Warn("writing job summary", "error", err)
+			}
 		}
+	}()
+
+	// Allow a minute of slack for server-side backdating or clock skew.
+	if issued > lifetime+time.Minute {
+		return fmt.Errorf("CA issued a certificate valid for %s, longer than the requested %s", issued, lifetime)
+	}
+
+	if mtlsURL != "" {
+		status, body, err := mtlsProbe(ctx, mtlsURL, &clientCert)
+		if err != nil {
+			fmt.Fprintf(&summary, "| mTLS with issued cert | **failed**: `%v` |\n", err)
+			return fmt.Errorf("mTLS request to %s: %w", mtlsURL, err)
+		}
+		if status < 200 || status >= 300 {
+			fmt.Fprintf(&summary, "| mTLS with issued cert | **failed**: HTTP %d |\n", status)
+			return fmt.Errorf("mTLS request to %s with the issued certificate returned HTTP %d: %s", mtlsURL, status, body)
+		}
+		logger.Info("mTLS with issued certificate succeeded", "url", mtlsURL, "status", status, "body", body)
+		fmt.Fprintf(&summary, "| mTLS with issued cert | succeeded: HTTP %d |\n", status)
 	}
 	return nil
+}
+
+// tlsCertificate pairs the PEM chain with its in-memory private key.
+func tlsCertificate(chainPEM []byte, key *ecdsa.PrivateKey) (tls.Certificate, error) {
+	var cert tls.Certificate
+	for rest := chainPEM; ; {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type == "CERTIFICATE" {
+			cert.Certificate = append(cert.Certificate, block.Bytes)
+		}
+	}
+	if len(cert.Certificate) == 0 {
+		return cert, errors.New("certificate chain contains no certificates")
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return cert, fmt.Errorf("parsing leaf certificate: %w", err)
+	}
+	cert.Leaf = leaf
+	cert.PrivateKey = key
+	return cert, nil
+}
+
+// mtlsProbe GETs url, presenting cert as the TLS client certificate when it
+// is non-nil. It returns the HTTP status and the start of the body.
+func mtlsProbe(ctx context.Context, url string, cert *tls.Certificate) (int, string, error) {
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	if cert != nil {
+		tlsConfig.Certificates = []tls.Certificate{*cert}
+	}
+	client := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: tlsConfig},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return resp.StatusCode, strings.TrimSpace(string(body)), nil
 }
 
 // newCSR builds a CSR from the CSR_* environment variables. The order's
@@ -161,12 +281,17 @@ func newCSR(key *ecdsa.PrivateKey) (*x509.CertificateRequest, error) {
 	return x509.ParseCertificateRequest(der)
 }
 
-func appendSummary(path string, chain []byte) error {
+func appendSummary(path string, chain []byte, results string) error {
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(f, "### Issued certificate chain\n\n```\n%s```\n", chain)
+	if results != "" {
+		_, err = fmt.Fprintf(f, "### mTLS test\n\n| Check | Result |\n|---|---|\n%s\n", results)
+	}
+	if err == nil {
+		_, err = fmt.Fprintf(f, "### Issued certificate chain\n\n```\n%s```\n", chain)
+	}
 	return errors.Join(err, f.Close())
 }
 
