@@ -2,7 +2,7 @@ module github.com/Zaita/rasmussen-acme-wif-example
 
 go 1.26.0
 
-replace github.com/mholt/acmez/v3 => github.com/Zaita/acmez/v3 v3.0.0-20261014093507-3c5180dc6c4c
+replace github.com/mholt/acmez/v3 => github.com/Zaita/acmez/v3 v3.0.0-20261117012222-36c309b05c5f
 
 require github.com/mholt/acmez/v3 v3.0.0-00010101000000-000000000000
 
