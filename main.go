@@ -1,7 +1,9 @@
 // Command rasmussen-acme-wif-example obtains a certificate from an ACME
-// server using the wif-01 challenge (draft-rasmussen-acme-wif), presenting
-// the GitHub Actions OIDC token of the job it runs in. It is configured
-// entirely through environment variables; see README.md.
+// server using Workload Identity Federation (draft-rasmussen-acme-wif-01):
+// it sends the GitHub Actions OIDC token of the job it runs in with the
+// newOrder request, and the CA pre-authorizes the identifiers its policy
+// grants to this workflow. It is configured entirely through environment
+// variables; see README.md.
 package main
 
 import (
@@ -74,31 +76,37 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		}
 	}
 
+	// No challenge solvers: every identifier must be pre-authorized by the
+	// WIF token sent with the order. An identifier the CA's policy does not
+	// cover fails with "no solvers available" rather than falling back.
 	client := acmez.Client{
 		Client: &acme.Client{
 			Directory: directoryURL,
 			UserAgent: "rasmussen-acme-wif-example",
 			Logger:    logger,
 		},
-		ChallengeSolvers: map[string]acmez.Solver{
-			acme.ChallengeTypeWIF01: acmez.NewGitHubActionsWIF01Solver(),
-		},
 	}
 
+	// "Clients MUST NOT send "wifToken" to a server whose directory lacks
+	// the "wif" object." draft-rasmussen-acme-wif-01 §4.1
 	dir, err := client.GetDirectory(ctx)
 	if err != nil {
 		return fmt.Errorf("fetching directory: %w", err)
 	}
 	if dir.Meta == nil || dir.Meta.WIF == nil {
-		logger.Warn("directory does not advertise wif-01 support (meta.wif); continuing anyway")
-	} else if len(dir.Meta.WIF.Issuers) > 0 && !slices.Contains(dir.Meta.WIF.Issuers, acmez.GitHubActionsIssuer) {
+		return errors.New("directory does not advertise Workload Identity Federation support (meta.wif)")
+	}
+	wif := dir.Meta.WIF
+	logger.Info("directory advertises WIF support",
+		"issuers", wif.Issuers, "maxTokenLifetime", wif.MaxTokenLifetime, "required", wif.Required)
+	if len(wif.Issuers) > 0 && !slices.Contains(wif.Issuers, acmez.GitHubActionsIssuer) {
 		logger.Warn("directory does not list the GitHub Actions issuer",
-			"issuer", acmez.GitHubActionsIssuer, "accepted", dir.Meta.WIF.Issuers)
+			"issuer", acmez.GitHubActionsIssuer, "accepted", wif.Issuers)
 	}
 
-	// A fresh account on every run: wif-01 needs no EAB or pre-shared
-	// secret, and the account holds no authority of its own.
-	// draft-rasmussen-acme-wif-00 §5.1, §5.3
+	// A fresh account on every run: WIF needs no EAB or pre-shared secret,
+	// and the account holds no authority of its own.
+	// draft-rasmussen-acme-wif-01 §5
 	accountKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return fmt.Errorf("generating account key: %w", err)
@@ -131,6 +139,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	now := time.Now()
 	params.NotBefore = now
 	params.NotAfter = now.Add(lifetime)
+	// For each newOrder request (and each retry) acmez requests an OIDC
+	// token from the runner whose audience is the Audience Binding Value of
+	// that request's nonce and this account key, and sends it as
+	// "wifToken". draft-rasmussen-acme-wif-01 §3, §4.1
+	params.WIFTokenSource = acmez.GitHubActionsTokenSource(nil)
 	logger.Info("requesting short-lived certificate", "notBefore", params.NotBefore, "notAfter", params.NotAfter)
 
 	certs, err := client.ObtainCertificate(ctx, params)

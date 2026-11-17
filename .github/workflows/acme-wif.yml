@@ -1,11 +1,12 @@
-# Obtains a certificate with the ACME wif-01 challenge
-# (https://datatracker.ietf.org/doc/draft-rasmussen-acme-wif/), proving
-# control of the identifiers with this job's GitHub Actions OIDC token
-# instead of DNS/HTTP validation or External Account Binding.
+# Obtains a certificate with ACME Workload Identity Federation
+# (https://datatracker.ietf.org/doc/draft-rasmussen-acme-wif/01/). The job
+# sends its GitHub Actions OIDC token in the newOrder request ("wifToken"),
+# and the CA pre-authorizes the identifiers its policy grants to this
+# workflow. No DNS/HTTP challenge or External Account Binding is needed.
 #
-# The ACME server must accept the issuer
-# https://token.actions.githubusercontent.com and have a policy entry that
-# permits this workflow to obtain the identifiers below. Per Appendix A.1 of
+# The ACME server must advertise meta.wif in its directory, accept the issuer
+# https://token.actions.githubusercontent.com, and have a policy entry that
+# permits this workflow to obtain the identifiers below. Per Appendix A of
 # the draft, that policy should match repository_id and repository_owner_id
 # (not the mutable names) and constrain ref or environment.
 #
@@ -16,14 +17,14 @@
 #
 # Replace every value marked TODO before running.
 
-name: ACME wif-01 certificate
+name: ACME WIF certificate
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write # lets the job request OIDC tokens for the wif-01 challenge
+  id-token: write # lets the job request the OIDC token it sends with the ACME order
 
 jobs:
   certificate:
